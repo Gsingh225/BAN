@@ -1,78 +1,46 @@
 #!/usr/bin/env python3
 
 import re
-import networkx as nx
-import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
+
+###############################################################################
+# 1) PARSE THE BRACKET-AND-ARROW FORMAT
+###############################################################################
 
 def parse_molecule(text):
     """
-    Parses the bracket-and-arrow text format into a nested Python dict.
-    
-    Example input (Diethylamine):
-    N [ 
-      bottom -> lp,
-      left   -> -H,
-      top    -> -C [
-          left  -> -H,
-          right -> -H,
-          top   -> -C [
-              left  -> -H,
-              right -> -H,
-              top   -> -H
-          ]
-      ],
-      right  -> -C [
-          left  -> -H,
-          right -> -H,
-          top   -> -C [
-              left  -> -H,
-              right -> -H,
-              top   -> -H
-          ]
-      ]
-    ]
-
-    Returns a dict of the form:
-    {
-      'atom': 'N',
-      'charge': None,
-      'substituents': [
+    Parses bracket-and-arrow text (e.g., diethylamine).
+    Returns a nested dict structure:
         {
-          'orientation': 'bottom',
-          'bond_order': None,
-          'child': {
-            'atom': 'lp',
-            'charge': None,
-            'substituents': []
-          }
-        },
-        ...
-      ]
-    }
+          'atom': 'N',
+          'charge': None,
+          'substituents': [
+            {
+              'orientation': 'bottom',
+              'bond_order': '-',
+              'child': {...}  # child dict
+            },
+            ...
+          ]
+        }
     """
 
-    # Pre-process the text to separate tokens
-    prepped = text
     for tok in ["[", "]", ",", "->"]:
-        prepped = prepped.replace(tok, f" {tok} ")
-    tokens = prepped.split()
+        text = text.replace(tok, f" {tok} ")
+    tokens = text.split()
 
-    def consume_atom_and_block(token_list):
-        """
-        Recursively parse something like:
-           N [ top -> -C [ ... ], bottom -> lp ]
-        """
-        if not token_list:
-            raise ValueError("Ran out of tokens while expecting an atom token!")
-
-        # First token might be "N", "N(+1)", "C", "lp", "H", etc.
-        atom_token = token_list.pop(0)
+    def consume_atom_and_block(tokens_list):
+        if not tokens_list:
+            raise ValueError("Ran out of tokens while expecting an atom token.")
+        atom_token = tokens_list.pop(0)
+        # e.g. "N", "N(+1)", "C", "lp", ...
         match_atom = re.match(r'^([A-Za-z]+)(\([+-]?\d+\))?$', atom_token)
         if not match_atom:
             raise ValueError(f"Unexpected token for atom: {atom_token}")
 
-        base_atom = match_atom.group(1)       # e.g. "N", "C", "lp" ...
-        maybe_charge = match_atom.group(2)    # e.g. "(+1)" or None
+        base_atom = match_atom.group(1)
+        maybe_charge = match_atom.group(2)
         charge = maybe_charge.strip("()") if maybe_charge else None
 
         node = {
@@ -81,136 +49,172 @@ def parse_molecule(text):
             'substituents': []
         }
 
-        # If next token is '[', parse the bracket block
-        if token_list and token_list[0] == '[':
-            token_list.pop(0)  # consume '['
-            while token_list and token_list[0] != ']':
-                if token_list[0] == ',':
-                    token_list.pop(0)  # skip commas
-
-                if not token_list:
+        # If next token is '[', parse bracket
+        if tokens_list and tokens_list[0] == '[':
+            tokens_list.pop(0)  # consume '['
+            while tokens_list and tokens_list[0] != ']':
+                if tokens_list[0] == ',':
+                    tokens_list.pop(0)
+                if not tokens_list:
                     raise ValueError("Unexpected end inside bracket block.")
 
-                # orientation or label
-                orientation = token_list.pop(0)
+                orientation = tokens_list.pop(0)
+                if tokens_list and tokens_list[0] == '->':
+                    tokens_list.pop(0)
 
-                # If the next token is '->', consume it
-                if token_list and token_list[0] == '->':
-                    token_list.pop(0)
-
-                # Possibly a bond symbol at the start of the next token (e.g. '-C' or '=O' or '#N')
                 bond_order = None
-                if token_list:
-                    peek = token_list[0]
+                if tokens_list:
+                    peek = tokens_list[0]
                     bond_match = re.match(r'^([-=#])(\S.*)$', peek)
                     if bond_match:
-                        bond_order = bond_match.group(1)  # '-', '=', '#'
-                        remainder = bond_match.group(2)   # e.g. 'C', 'N(+1)', ...
-                        # Replace the token with remainder so we can parse that as an atom token
-                        token_list[0] = remainder
+                        bond_order = bond_match.group(1)
+                        remainder = bond_match.group(2)
+                        tokens_list[0] = remainder
 
-                # Recursively parse child
-                child = consume_atom_and_block(token_list)
-
+                child = consume_atom_and_block(tokens_list)
                 node['substituents'].append({
                     'orientation': orientation,
                     'bond_order': bond_order,
                     'child': child
                 })
 
-            # We expect a closing ']'
-            if not token_list or token_list[0] != ']':
+            if not tokens_list or tokens_list[0] != ']':
                 raise ValueError("Missing ']' after bracket block.")
-            token_list.pop(0)  # consume ']'
+            tokens_list.pop(0)  # consume ']'
 
         return node
 
     top_node = consume_atom_and_block(tokens)
-
     if tokens:
         raise ValueError(f"Extra tokens left after parse: {tokens}")
-
     return top_node
 
+###############################################################################
+# 2) BUILD AN RDKit MOL (SKIPPING LONE PAIRS)
+###############################################################################
 
-def build_nx_graph(node, g=None):
+def build_rdkit_mol(parsed_node):
     """
-    Recursively build a NetworkX graph from the nested parse dict.
-    Each atom or 'lp' is a graph node; each substituent is an edge.
+    Build an RDKit RWMol from the parsed structure.
+    - "lp" nodes (lone pairs) are skipped, as RDKit doesn't treat them as separate atoms.
+    - Bond orders: '-', '=', '#'.
+    - Formal charges: e.g. N(+1).
 
-    Returns: (G, node_id)
-      where G is the final NetworkX graph,
-            node_id is the integer ID for this node in the graph.
+    Returns an RDKit Mol object.
     """
-    if g is None:
-        g = nx.Graph()
+    rwmol = Chem.RWMol()
 
-    # Create a new node ID
-    node_id = len(g.nodes)
+    # We'll assign each *non-lp* node a unique integer ID, stored in id_map[id(node_dict)].
+    id_map = {}
+    node_id_counter = [0]  # store in a list to mutate in nested func
 
-    # Build a label that includes any charge
-    label = node['atom']
-    if node['charge']:
-        label += f"({node['charge']})"
+    def traverse_assign_ids(node):
+        """
+        Recursively assigns integer IDs to each node with a real atom
+        (skip 'lp'), storing in id_map[id(node)] = some_id.
+        """
+        # If atom is 'lp', skip giving an ID, but still traverse children (rare)
+        if node['atom'].lower() == 'lp':
+            for sub in node['substituents']:
+                traverse_assign_ids(sub['child'])
+            return
 
-    # Add the node with attributes
-    g.add_node(node_id, label=label, atom=node['atom'], charge=node['charge'])
+        # Give this node an ID
+        this_id = node_id_counter[0]
+        node_id_counter[0] += 1
+        id_map[id(node)] = this_id
 
-    # Recurse over substituents
-    for sub in node['substituents']:
-        bond_order = sub['bond_order'] if sub['bond_order'] else '-'
-        child_dict = sub['child']
-        # Build the child as well
-        g, child_id = build_nx_graph(child_dict, g)
-        # Add an edge for this substituent
-        g.add_edge(node_id, child_id, bond_order=bond_order, orientation=sub['orientation'])
+        # Recurse children
+        for sub in node['substituents']:
+            traverse_assign_ids(sub['child'])
 
-    return g, node_id
+    traverse_assign_ids(parsed_node)
 
+    # Make sure we have enough placeholder atoms
+    # The highest ID we assigned is node_id_counter[0], so we need that many atoms
+    total_atoms = node_id_counter[0]
+    for _ in range(total_atoms):
+        rwmol.AddAtom(Chem.Atom(0))  # atomic number=0 placeholder
 
-def draw_molecule(g):
-    """
-    Draw the molecule using NetworkX + Matplotlib.
-    We use a force-directed layout (spring_layout) to avoid collisions.
-    Double/triple bonds are drawn thicker for demonstration.
-    """
-    # Compute 2D coordinates (you can also try kamada_kawai_layout, etc.)
-    pos = nx.spring_layout(g, k=0.7, iterations=100, seed=42)
+    def get_atom_info(atom_label, charge_str):
+        """
+        Convert e.g. 'N', charge_str='-1' => (atomic_num=7, formal_charge=-1).
+        If unknown, default to carbon (atomic_num=6).
+        If 'lp', return None => skip.
+        """
+        if atom_label.lower() == 'lp':
+            return None, None
+        # minimal periodic table
+        symbol_map = {
+            'H': 1, 'He': 2,
+            'Li': 3, 'Be': 4,
+            'B': 5, 'C': 6,
+            'N': 7, 'O': 8,
+            'F': 9, 'P': 15,
+            'S': 16, 'Cl': 17,
+            'Br': 35, 'I': 53
+        }
+        atomic_num = symbol_map.get(atom_label, 6)  # default carbon
+        formal_charge = 0
+        if charge_str is not None:
+            formal_charge = int(charge_str)
+        return atomic_num, formal_charge
 
-    # Separate edges by bond order for different styling
-    single_edges = []
-    double_edges = []
-    triple_edges = []
-    for (u, v, edata) in g.edges(data=True):
-        bo = edata.get('bond_order', '-')
-        if bo == '-':
-            single_edges.append((u, v))
-        elif bo == '=':
-            double_edges.append((u, v))
-        elif bo == '#':
-            triple_edges.append((u, v))
-        else:
-            # fallback
-            single_edges.append((u, v))
+    def add_atoms_and_bonds(node, parent_node=None, bond_order=None):
+        """
+        Recursively build the graph in rwmol.
+        If node is 'lp', skip. If parent != None, connect them via bond_order.
+        """
+        if node['atom'].lower() == 'lp':
+            # skip building an atom, but continue children
+            for s in node['substituents']:
+                add_atoms_and_bonds(s['child'], None, s['bond_order'])
+            return
 
-    # Draw edges
-    plt.figure(figsize=(8, 6))
-    nx.draw_networkx_edges(g, pos, edgelist=single_edges, width=1.0, edge_color='k')
-    nx.draw_networkx_edges(g, pos, edgelist=double_edges, width=2.0, edge_color='k')
-    nx.draw_networkx_edges(g, pos, edgelist=triple_edges, width=3.0, edge_color='k')
+        # get ID for this node
+        this_idx = id_map[id(node)]
+        # fill in correct atomic info
+        atomic_num, formal_charge = get_atom_info(node['atom'], node['charge'])
+        atom = rwmol.GetAtomWithIdx(this_idx)
+        atom.SetAtomicNum(atomic_num)
+        atom.SetFormalCharge(formal_charge)
 
-    # Draw nodes
-    node_labels = nx.get_node_attributes(g, 'label')
-    nx.draw_networkx_nodes(g, pos, node_color='lightblue', node_size=600)
-    nx.draw_networkx_labels(g, pos, labels=node_labels, font_size=10)
+        if parent_node is not None:
+            parent_idx = id_map[id(parent_node)]
+            rd_bond = Chem.BondType.SINGLE
+            if bond_order == '=':
+                rd_bond = Chem.BondType.DOUBLE
+            elif bond_order == '#':
+                rd_bond = Chem.BondType.TRIPLE
 
-    plt.title("Molecule via Force-Directed Layout")
-    plt.axis('off')
-    plt.show()
+            # add bond if not present
+            if rwmol.GetBondBetweenAtoms(parent_idx, this_idx) is None:
+                rwmol.AddBond(parent_idx, this_idx, rd_bond)
 
+        # Recurse children
+        for s in node['substituents']:
+            add_atoms_and_bonds(s['child'], node, s['bond_order'])
+
+    add_atoms_and_bonds(parsed_node, None, None)
+
+    # Remove any leftover dummy atoms (atomicNum=0)
+    remove_list = []
+    for a in rwmol.GetAtoms():
+        if a.GetAtomicNum() == 0:
+            remove_list.append(a.GetIdx())
+    # Must remove from highest to lowest
+    for idx in sorted(remove_list, reverse=True):
+        rwmol.RemoveAtom(idx)
+
+    mol = rwmol.GetMol()
+    Chem.SanitizeMol(mol)
+    return mol
+
+###############################################################################
+# 3) DEMO
+###############################################################################
 
 def main():
-    # Diethylamine example
     diethylamine_text = """
     N [ 
       bottom -> lp,
@@ -238,13 +242,13 @@ def main():
 
     # 1) Parse
     tree = parse_molecule(diethylamine_text)
-
-    # 2) Build the NetworkX graph
-    g, root_id = build_nx_graph(tree)
-
-    # 3) Draw the molecule with a standard 2D layout
-    draw_molecule(g)
-
+    # 2) Build RDKit molecule (skipping lone pairs)
+    mol = build_rdkit_mol(tree)
+    # 3) Compute 2D coords
+    AllChem.Compute2DCoords(mol)
+    # 4) Draw
+    img = Draw.MolToImage(mol, size=(300, 300))
+    img.show()  # or img.save("diethylamine.png")
 
 if __name__ == "__main__":
     main()
