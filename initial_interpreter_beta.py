@@ -10,22 +10,21 @@ from rdkit.Chem import AllChem, Draw
 
 def parse_molecule(text):
     """
-    Parses bracket-and-arrow text (e.g., diethylamine).
-    Returns a nested dict structure:
-        {
-          'atom': 'N',
-          'charge': None,
-          'substituents': [
-            {
-              'orientation': 'bottom',
-              'bond_order': '-',
-              'child': {...}  # child dict
-            },
-            ...
-          ]
-        }
+    Parses bracket-and-arrow text (e.g., diethylamine) into a nested dict:
+      {
+        'atom': 'N',
+        'charge': None,
+        'substituents': [
+           {
+             'orientation': 'bottom',
+             'bond_order': '-',
+             'child': {...}  # child dict
+           },
+           ...
+        ]
+      }
     """
-
+    # Insert spacing around special tokens
     for tok in ["[", "]", ",", "->"]:
         text = text.replace(tok, f" {tok} ")
     tokens = text.split()
@@ -33,8 +32,9 @@ def parse_molecule(text):
     def consume_atom_and_block(tokens_list):
         if not tokens_list:
             raise ValueError("Ran out of tokens while expecting an atom token.")
+
         atom_token = tokens_list.pop(0)
-        # e.g. "N", "N(+1)", "C", "lp", ...
+        # Example: "N", "N(+1)", "C", "lp", ...
         match_atom = re.match(r'^([A-Za-z]+)(\([+-]?\d+\))?$', atom_token)
         if not match_atom:
             raise ValueError(f"Unexpected token for atom: {atom_token}")
@@ -49,16 +49,17 @@ def parse_molecule(text):
             'substituents': []
         }
 
-        # If next token is '[', parse bracket
+        # If next token is '[', parse bracket content
         if tokens_list and tokens_list[0] == '[':
             tokens_list.pop(0)  # consume '['
             while tokens_list and tokens_list[0] != ']':
                 if tokens_list[0] == ',':
-                    tokens_list.pop(0)
+                    tokens_list.pop(0)  # skip comma
+
                 if not tokens_list:
                     raise ValueError("Unexpected end inside bracket block.")
 
-                orientation = tokens_list.pop(0)
+                orientation = tokens_list.pop(0)  # e.g. 'bottom','top','left','right'
                 if tokens_list and tokens_list[0] == '->':
                     tokens_list.pop(0)
 
@@ -87,72 +88,63 @@ def parse_molecule(text):
     top_node = consume_atom_and_block(tokens)
     if tokens:
         raise ValueError(f"Extra tokens left after parse: {tokens}")
+
     return top_node
 
 ###############################################################################
-# 2) BUILD AN RDKit MOL (SKIPPING LONE PAIRS)
+# 2) BUILD AN RDKit MOL, INCLUDING "lp" AS DUMMY ATOMS
 ###############################################################################
 
 def build_rdkit_mol(parsed_node):
     """
     Build an RDKit RWMol from the parsed structure.
-    - "lp" nodes (lone pairs) are skipped, as RDKit doesn't treat them as separate atoms.
+    - Real atoms (C, H, N, O, etc.) get normal atomic numbers.
+    - 'lp' is a dummy atom (atomic_num=0) labeled "lp", with a single bond to its parent.
     - Bond orders: '-', '=', '#'.
     - Formal charges: e.g. N(+1).
-
-    Returns an RDKit Mol object.
+    
+    Because dummy atoms with real bonds break normal valence rules, we
+    skip standard sanitization (use SANITIZE_NONE). So this is purely
+    a hack for visualization.
     """
+
     rwmol = Chem.RWMol()
 
-    # We'll assign each *non-lp* node a unique integer ID, stored in id_map[id(node_dict)].
+    # We'll assign each node an integer ID, stored in id_map[id(node_dict)].
     id_map = {}
-    node_id_counter = [0]  # store in a list to mutate in nested func
+    node_id_counter = [0]
 
     def traverse_assign_ids(node):
-        """
-        Recursively assigns integer IDs to each node with a real atom
-        (skip 'lp'), storing in id_map[id(node)] = some_id.
-        """
-        # If atom is 'lp', skip giving an ID, but still traverse children (rare)
-        if node['atom'].lower() == 'lp':
-            for sub in node['substituents']:
-                traverse_assign_ids(sub['child'])
-            return
-
-        # Give this node an ID
+        # Give every node, including 'lp', an ID
         this_id = node_id_counter[0]
         node_id_counter[0] += 1
         id_map[id(node)] = this_id
 
-        # Recurse children
+        # Recurse
         for sub in node['substituents']:
             traverse_assign_ids(sub['child'])
 
     traverse_assign_ids(parsed_node)
-
-    # Make sure we have enough placeholder atoms
-    # The highest ID we assigned is node_id_counter[0], so we need that many atoms
     total_atoms = node_id_counter[0]
-    for _ in range(total_atoms):
-        rwmol.AddAtom(Chem.Atom(0))  # atomic number=0 placeholder
 
+    # Create placeholder atoms
+    for _ in range(total_atoms):
+        rwmol.AddAtom(Chem.Atom(0))  # atomicNum=0 => dummy
+
+    # Helper for real atoms
     def get_atom_info(atom_label, charge_str):
         """
         Convert e.g. 'N', charge_str='-1' => (atomic_num=7, formal_charge=-1).
-        If unknown, default to carbon (atomic_num=6).
-        If 'lp', return None => skip.
+        If unknown, default to carbon (6).
+        If 'lp', we keep it dummy => (0, 0).
         """
         if atom_label.lower() == 'lp':
-            return None, None
-        # minimal periodic table
+            # We'll keep atomic_num=0 => dummy
+            return 0, 0
+        # minimal map
         symbol_map = {
-            'H': 1, 'He': 2,
-            'Li': 3, 'Be': 4,
-            'B': 5, 'C': 6,
-            'N': 7, 'O': 8,
-            'F': 9, 'P': 15,
-            'S': 16, 'Cl': 17,
-            'Br': 35, 'I': 53
+            'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9,
+            'P': 15, 'S': 16, 'Cl': 17, 'Br': 35, 'I': 53
         }
         atomic_num = symbol_map.get(atom_label, 6)  # default carbon
         formal_charge = 0
@@ -161,23 +153,22 @@ def build_rdkit_mol(parsed_node):
         return atomic_num, formal_charge
 
     def add_atoms_and_bonds(node, parent_node=None, bond_order=None):
-        """
-        Recursively build the graph in rwmol.
-        If node is 'lp', skip. If parent != None, connect them via bond_order.
-        """
-        if node['atom'].lower() == 'lp':
-            # skip building an atom, but continue children
-            for s in node['substituents']:
-                add_atoms_and_bonds(s['child'], None, s['bond_order'])
-            return
-
-        # get ID for this node
         this_idx = id_map[id(node)]
-        # fill in correct atomic info
-        atomic_num, formal_charge = get_atom_info(node['atom'], node['charge'])
+        atom_label = node['atom']
+        atom_charge = node['charge']
+
+        # Set up the placeholder atom
+        atomic_num, fcharge = get_atom_info(atom_label, atom_charge)
         atom = rwmol.GetAtomWithIdx(this_idx)
         atom.SetAtomicNum(atomic_num)
-        atom.SetFormalCharge(formal_charge)
+        atom.SetFormalCharge(fcharge)
+
+        # If it's an lp dummy, attach a property so we can rename it
+        if atom_label.lower() == 'lp':
+            # We can store a special property so the RDKit drawer
+            # will show "lp" instead of "*"
+            # "molFileAlias" is recognized by RDKit if we skip normal sanitize
+            atom.SetProp("molFileAlias", "lp")
 
         if parent_node is not None:
             parent_idx = id_map[id(parent_node)]
@@ -187,31 +178,27 @@ def build_rdkit_mol(parsed_node):
             elif bond_order == '#':
                 rd_bond = Chem.BondType.TRIPLE
 
-            # add bond if not present
+            # Check if there's already a bond
             if rwmol.GetBondBetweenAtoms(parent_idx, this_idx) is None:
                 rwmol.AddBond(parent_idx, this_idx, rd_bond)
 
-        # Recurse children
-        for s in node['substituents']:
-            add_atoms_and_bonds(s['child'], node, s['bond_order'])
+        # Recurse for children
+        for sub in node['substituents']:
+            add_atoms_and_bonds(sub['child'], node, sub['bond_order'])
 
     add_atoms_and_bonds(parsed_node, None, None)
 
-    # Remove any leftover dummy atoms (atomicNum=0)
-    remove_list = []
-    for a in rwmol.GetAtoms():
-        if a.GetAtomicNum() == 0:
-            remove_list.append(a.GetIdx())
-    # Must remove from highest to lowest
-    for idx in sorted(remove_list, reverse=True):
-        rwmol.RemoveAtom(idx)
-
+    # Convert to normal Mol, skipping standard sanitization
     mol = rwmol.GetMol()
-    Chem.SanitizeMol(mol)
+    # We skip full sanitization because dummy atoms with real bonds can fail valence checks
+    Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_NONE)
+    # This partial sanitize ensures we at least get ring info, etc., if needed
+    Chem.rdmolops.SetAromaticity(mol)
+
     return mol
 
 ###############################################################################
-# 3) DEMO
+# 3) DEMO: PARSE, BUILD, DRAW
 ###############################################################################
 
 def main():
@@ -242,13 +229,20 @@ def main():
 
     # 1) Parse
     tree = parse_molecule(diethylamine_text)
-    # 2) Build RDKit molecule (skipping lone pairs)
+
+    # 2) Build RDKit molecule (with "lp" as dummy atoms)
     mol = build_rdkit_mol(tree)
+
     # 3) Compute 2D coords
+    # RDKit will lay out the entire graph, including dummy "lp" atoms.
     AllChem.Compute2DCoords(mol)
-    # 4) Draw
-    img = Draw.MolToImage(mol, size=(300, 300))
-    img.show()  # or img.save("diethylamine.png")
+
+    # 4) Draw to an image
+    img = Draw.MolToImage(mol, size=(400, 400))
+    img.show()  # pop-up if environment supports it
+
+    # Optionally save
+    # img.save("diethylamine_with_lp.png")
 
 if __name__ == "__main__":
     main()
